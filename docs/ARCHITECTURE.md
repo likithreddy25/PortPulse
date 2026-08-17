@@ -1,6 +1,6 @@
 # PortPulse Architecture
 
-Status: Phases 1-3 built and tested (locally, plus a partial real AWS
+Status: Phases 1-4 built and tested (locally, plus a partial real AWS
 deployment — Kinesis stream, S3 bucket, IAM roles, Glue database/table;
 see [README.md](../README.md#build-status) and #cost for exactly what's
 real vs. local-only). This doc describes the target end-state
@@ -37,8 +37,9 @@ AISStream.io (WebSocket)
 [Phase 3 - BUILT: writes local Parquet partitioned by port_id, not yet S3] S3 curated zone (Parquet)
       |
       v
-[Phase 4 - NOT BUILT] Redshift Serverless (COPY load)
-      | star schema: fact_port_congestion_hourly, dim_port, dim_vessel_type
+[Phase 4 - schema + load scripts BUILT + validated against real Postgres, NOT deployed] Redshift Serverless (COPY/MERGE load)
+      | star schema: fact_port_congestion_hourly, dim_port (real), dim_vessel_type
+      | (real standardized AIS ship-type reference data, not yet joined to any fact)
       v
 [Phase 5 - NOT BUILT] SARIMAX forecast per port, written back to Redshift
       |
@@ -85,6 +86,29 @@ account is under a month old) requiring either an AWS Support case or a
 Console-side check — being investigated by the project owner. Firehose
 delivery stream creation hasn't been attempted yet since it comes after
 the crawler step in the deploy sequence.
+
+## Redshift schema validation notes
+
+`warehouse/redshift_ddl/schema.sql` was checked against a real local
+Postgres container (Docker), not just read over -- this caught a column
+width bug and, more importantly, surfaced two real Postgres-vs-Redshift
+dialect differences that would otherwise have only shown up against a
+live, billable Redshift endpoint:
+1. Redshift has no `ON CONFLICT ... DO UPDATE` -- upserts use `MERGE`
+   (confirmed against AWS's MERGE docs, `load.sql` rewritten accordingly).
+2. Redshift does not enforce PK/FK/UNIQUE constraints (only `NOT NULL`)
+   -- Postgres does, so a bad `port_id` or duplicate `(port_id,
+   hour_start)` that Postgres would reject would load into real Redshift
+   silently. `load.sql`'s `MERGE` is what actually prevents duplicates in
+   production, not the declared primary key.
+
+`dim_vessel_type` is seeded from the standardized AIS/ITU-R M.1371 ship
+type classification (real external reference data) but isn't joined to
+any fact data yet -- `ingestion/aisstream_client.py` only requests
+AISStream's `PositionReport` message type, not `ShipStaticData` (where
+AIS actually reports vessel type). Capturing that and mapping MMSI ->
+vessel_type_id would be the natural next step to make the dimension
+actually used rather than a populated-but-unreferenced reference table.
 
 ## IAM / security model
 

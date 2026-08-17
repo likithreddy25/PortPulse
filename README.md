@@ -5,7 +5,7 @@ at 5 major container ports via AIS and computes a per-port congestion
 index (vessel count, dwell time, queue length) with a short-horizon
 forecast.
 
-**Status: Phases 1-3 of 9 built and tested locally.** This is a
+**Status: Phases 1-4 of 9 built and tested locally.** This is a
 portfolio project built incrementally and validated at each phase — see
 [Build status](#build-status) for exactly what's working today versus
 what's still ahead. **Partial real AWS deployment exists** (Kinesis
@@ -161,9 +161,56 @@ not yet pointed at EMR Serverless):**
     measurements** — they're a byproduct of too short a window and
     uncalibrated caps, not a finished analytical result.
 
-**Not yet built:** Redshift (Phase 4), forecasting (Phase 5), dashboard
-(Phase 6), orchestration/monitoring (Phase 7), CloudFormation (Phase 8),
-teardown tooling (Phase 9).
+**What's built and tested (Phase 4 — Redshift warehouse, not yet deployed
+to real AWS):**
+- `warehouse/redshift_ddl/schema.sql` — star schema: `dim_port` (real
+  data, generated straight from `ingestion/config.py` so it can't drift
+  from the ports actually tracked — see `generate_dim_port_seed.py`),
+  `dim_vessel_type` (seeded from the standardized AIS/ITU-R M.1371 ship
+  type classification — real external reference data, grouped at the
+  tens-digit level; **not yet linked to any fact data**, since ingestion
+  currently only requests AISStream's `PositionReport` message type, not
+  `ShipStaticData` where AIS actually reports vessel type — flagged in
+  the DDL, not hidden), and `fact_port_congestion_hourly` (one row per
+  port per hour, matching Phase 3's curated output columns).
+- **Validated against a real local Postgres container** (via Docker),
+  not just eyeballed — this caught two real mistakes before they'd have
+  hit a billable Redshift endpoint: a `VARCHAR(100)` column too narrow
+  for the longer AIS category descriptions, and an earlier draft of
+  `load.sql` using PostgreSQL's `ON CONFLICT ... DO UPDATE` syntax,
+  which **Redshift does not support** — confirmed against AWS's own
+  MERGE documentation and rewritten to use Redshift's actual `MERGE`
+  statement. Also documented rather than left implicit: **Redshift does
+  not enforce PRIMARY KEY / FOREIGN KEY / UNIQUE constraints** (only
+  `NOT NULL`) — confirmed against AWS docs — so `load.sql`'s `MERGE`
+  keyed on `(port_id, hour_start)` is what actually prevents duplicate
+  rows in production, not the declared primary key.
+- `warehouse/deploy.py` — creates the Redshift Serverless namespace +
+  workgroup and applies the schema via the Redshift Data API (no VPC
+  network path needed). **Could not be verified via `moto`** — checked
+  directly, `moto` doesn't implement `redshift-serverless` yet
+  (`CreateNamespace` returns "Not yet implemented"), unlike Phase 2's
+  Kinesis/S3/Glue/Firehose, which did have moto support. Instead: the
+  exact request shapes were checked against AWS's own API reference
+  (camelCase parameters, confirmed against real docs rather than
+  guessed), and a real dry-run against the actual AWS account exercised
+  the read-only existence checks and confirmed the plan resolves
+  correctly, creating nothing.
+- A real bug caught along the way: the first version of the SQL-file
+  statement splitter broke on semicolons that appear naturally inside
+  comment *prose* (e.g. "...enforced; only NOT NULL is") — before
+  stripping comments first, it silently mis-parsed `schema.sql` into a
+  single giant garbage statement. Fixed and covered by 8 new tests.
+- 53 tests total, all passing (Docker-dependent warehouse tests skip
+  gracefully if Docker isn't running).
+- **Not yet deployed for real** — `publiclyAccessible=False` by design
+  (querying it should go through the Redshift Data API, not direct
+  psql/JDBC, to avoid needing VPC/security-group setup this project
+  doesn't have yet).
+
+**Not yet built:** forecasting (Phase 5), dashboard (Phase 6),
+orchestration/monitoring (Phase 7), CloudFormation (Phase 8), teardown
+tooling (Phase 9).
 
 **About the sample data:** two files live in `ingestion/sample_data/`,
 and they are not interchangeable —
@@ -244,34 +291,44 @@ install away. On macOS: `brew install openjdk@17`, then point
 
 ## Cost
 
-Nothing has been deployed to real AWS yet — everything above runs
-locally or against `moto`. Here's what deploying Phase 1+2
-(`streaming/deploy.py --confirm`) would actually cost, sourced from
-AWS's current published pricing (not estimated from memory):
+**Currently deployed for real** (as of 2026-08-17): a Kinesis stream, an
+S3 bucket, 2 IAM roles, and a Glue database/table — created while
+testing Phase 2, then blocked on the Glue crawler step (see Build
+status). These **are accruing real cost right now**, dominated by the
+Kinesis stream's fixed hourly charge below. Everything else (Firehose
+delivery stream, Glue crawler, Redshift namespace/workgroup) is
+config/code only, not yet deployed.
+
+Rates sourced from AWS's current published pricing (not estimated from
+memory):
 
 | Resource | Rate | Notes |
 |---|---|---|
-| Kinesis Data Stream (on-demand) | **$0.04/stream-hour** (~$28.80/mo) + $0.08/GB ingested + $0.04/GB retrieved | **This is the one fixed cost that accrues just for the stream existing**, independent of traffic. Everything else below is usage-based and negligible at our data volume (a few thousand small messages/hour). |
-| Firehose ingestion | $0.029/GB | rounded up to 5KB/record |
+| Kinesis Data Stream (on-demand) | **$0.04/stream-hour** (~$28.80/mo) + $0.08/GB ingested + $0.04/GB retrieved | **Currently running.** This is the one fixed cost that accrues just for the stream existing, independent of traffic. |
+| Firehose ingestion | $0.029/GB | rounded up to 5KB/record; not deployed yet |
 | Firehose format conversion (Parquet) | $0.018/GB | if the combined config works (see Build status) |
 | Firehose dynamic partitioning | $0.02/GB + $0.005/1,000 objects, +$0.07/JQ-processing-hour | usage-based |
 | S3 storage | ~$0.023/GB/month | negligible — our raw data is megabytes, not gigabytes |
-| Glue crawler | $0.44/DPU-hour, 1-min minimum | a few cents per manual run; not scheduled yet (that's Phase 7) |
+| Glue crawler | $0.44/DPU-hour, 1-min minimum | a few cents per manual run; not scheduled yet (that's Phase 7); currently blocked (see Build status) |
 | Glue Data Catalog | free under 1M objects/1M requests | nowhere close at this scale |
+| **Redshift Serverless** | **$0.375/RPU-hour, 4 RPU minimum = $1.50/hour while active**, billed per-second with a 60-second minimum per activation, **$0 while auto-paused/idle** | Not deployed yet. This is the single biggest per-hour rate in the whole project, but Serverless auto-pauses when nothing is querying it — a few minutes of testing a day stays well under $1. Leaving something actively querying it continuously would be the expensive mistake to avoid. |
 
-**Bottom line:** running Phase 1+2 for a day or two of testing is well
-under $2-3 total, dominated by the Kinesis stream's fixed hourly charge.
-Phase 9 will add an automated `teardown.sh`; until it exists, anything
-deployed here should be **manually deleted right after testing** rather
-than left running. **Suggested AWS Budget alert: $10/month**, generous
-enough not to false-alarm on normal testing but tight enough to catch a
-forgotten resource (e.g., a stream left running for days, or a crawler
-accidentally put on an hourly schedule) well before it becomes a real
-bill.
+**Bottom line:** what's deployed so far (Phase 1+2, partial) costs well
+under $2-3 for a day or two of testing, dominated by the Kinesis
+stream's fixed hourly charge. Redshift, if/when deployed, adds up fast
+only if left continuously active — auto-pause keeps occasional testing
+cheap. Phase 9 will add an automated `teardown.sh`; until it exists,
+anything deployed here should be **manually deleted right after
+testing** rather than left running. **Suggested AWS Budget alert:
+$10/month**, generous enough not to false-alarm on normal testing but
+tight enough to catch a forgotten resource (e.g., a stream left running
+for days, a crawler put on an hourly schedule, or a Redshift workgroup
+that never pauses) well before it becomes a real bill.
 
 Sources: [Kinesis Data Streams pricing](https://aws.amazon.com/kinesis/data-streams/pricing/),
 [Firehose pricing](https://aws.amazon.com/kinesis/data-firehose/pricing/),
-[Glue pricing](https://aws.amazon.com/glue/pricing/).
+[Glue pricing](https://aws.amazon.com/glue/pricing/),
+[Redshift pricing](https://aws.amazon.com/redshift/pricing/).
 
 ## Congestion index formula
 
