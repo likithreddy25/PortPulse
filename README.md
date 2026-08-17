@@ -5,7 +5,7 @@ at 5 major container ports via AIS and computes a per-port congestion
 index (vessel count, dwell time, queue length) with a short-horizon
 forecast.
 
-**Status: Phases 1-5 of 9 built and tested locally.** This is a
+**Status: Phases 1-6 of 9 built and tested locally.** This is a
 portfolio project built incrementally and validated at each phase — see
 [Build status](#build-status) for exactly what's working today versus
 what's still ahead. **Partial real AWS deployment exists** (Kinesis
@@ -238,8 +238,41 @@ to real AWS):**
   documented next step, not something faked now.
 - 5 new unit tests, 58 total, all passing.
 
-**Not yet built:** dashboard (Phase 6), orchestration/monitoring
-(Phase 7), CloudFormation (Phase 8), teardown tooling (Phase 9).
+**What's built and tested (Phase 6 — Dashboard):**
+- `dashboard/app.py` — a Streamlit dashboard (chosen over React: no build
+  step, fast to make "real and demo-able" for a Python-heavy data
+  project like this). Shows live congestion_index per port with a
+  forecast overlay, vessel_count/queue_length/dwell-time metrics, and an
+  explicit banner stating which data source is active — **never
+  ambiguous about whether you're looking at demo data or a live
+  warehouse.**
+- Two data sources, never silently falling back from one to the other:
+  `dashboard/data_source.py`'s `load_local()` (reads Phase 3's curated
+  Parquet directly — works today) and `load_redshift()` (Redshift Data
+  API — no VPC network path needed, but genuinely untested since
+  Redshift isn't deployed).
+- **Actually launched and verified in a browser against the real
+  captured data**, not just written and assumed to work. Caught and
+  fixed a real bug this way: Streamlit raised `StreamlitDuplicateElementId`
+  on the per-port chart loop (needed an explicit unique `key` per port,
+  since auto-generated IDs collided). After the fix, verified all 5
+  ports render correctly — 4 with real metrics from the captured sample,
+  and **Shanghai correctly showing "No data for this port yet"** rather
+  than a blank or broken chart (consistent with the Phase 3 finding that
+  the real capture had zero Shanghai messages).
+- Also verified the Redshift ("live") mode by actually switching to it
+  in the browser: with real AWS credentials present, it made a genuine
+  (harmless, read-only) `ExecuteStatement` call against `redshift-data`,
+  got back `ValidationException: Redshift endpoint doesn't exist in this
+  region` (expected — nothing's deployed), and displayed that error
+  cleanly instead of crashing the app.
+- 2 new unit tests for `data_source.py` (58 → 60 total).
+
+Run it: `streamlit run dashboard/app.py` (needs the Phase 3 curated
+Parquet at `/tmp/portpulse_curated` for demo mode — see Setup).
+
+**Not yet built:** orchestration/monitoring (Phase 7), CloudFormation
+(Phase 8), teardown tooling (Phase 9).
 
 **About the sample data:** two files live in `ingestion/sample_data/`,
 and they are not interchangeable —
@@ -317,6 +350,17 @@ python -m batch.emr_jobs.pipeline --input /tmp/normalized_live.jsonl \
 PySpark needs a real JDK (8, 11, or 17) on the machine — it's not a pip
 install away. On macOS: `brew install openjdk@17`, then point
 `JAVA_HOME` at it as shown above (no need to symlink it system-wide).
+
+Run the dashboard (after the Spark pipeline step above has produced
+`/tmp/portpulse_curated`):
+
+```bash
+streamlit run dashboard/app.py
+```
+
+Opens at `http://localhost:8501` in "Local Parquet (demo)" mode by
+default. Switching the sidebar to "Redshift (live)" only works once
+Phase 4 is actually deployed.
 
 ## Cost
 
