@@ -1,6 +1,6 @@
 # PortPulse Architecture
 
-Status: Phases 1-4 built and tested (locally, plus a partial real AWS
+Status: Phases 1-5 built and tested (locally, plus a partial real AWS
 deployment — Kinesis stream, S3 bucket, IAM roles, Glue database/table;
 see [README.md](../README.md#build-status) and #cost for exactly what's
 real vs. local-only). This doc describes the target end-state
@@ -41,7 +41,7 @@ AISStream.io (WebSocket)
       | star schema: fact_port_congestion_hourly, dim_port (real), dim_vessel_type
       | (real standardized AIS ship-type reference data, not yet joined to any fact)
       v
-[Phase 5 - NOT BUILT] SARIMAX forecast per port, written back to Redshift
+[Phase 5 - BUILT + tested against real data (correctly refuses to forecast, insufficient history) and synthetic data (forecast path works)] SARIMAX forecast per port, written back to Redshift
       |
       v
 [Phase 6 - NOT BUILT] Dashboard (React or Streamlit)

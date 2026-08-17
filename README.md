@@ -5,7 +5,7 @@ at 5 major container ports via AIS and computes a per-port congestion
 index (vessel count, dwell time, queue length) with a short-horizon
 forecast.
 
-**Status: Phases 1-4 of 9 built and tested locally.** This is a
+**Status: Phases 1-5 of 9 built and tested locally.** This is a
 portfolio project built incrementally and validated at each phase — see
 [Build status](#build-status) for exactly what's working today versus
 what's still ahead. **Partial real AWS deployment exists** (Kinesis
@@ -208,9 +208,38 @@ to real AWS):**
   psql/JDBC, to avoid needing VPC/security-group setup this project
   doesn't have yet).
 
-**Not yet built:** forecasting (Phase 5), dashboard (Phase 6),
-orchestration/monitoring (Phase 7), CloudFormation (Phase 8), teardown
-tooling (Phase 9).
+**What's built and tested (Phase 5 — SARIMAX forecasting):**
+- `forecasting/sarimax_forecast.py` — fits a SARIMAX(1,1,1) model (no
+  seasonal component yet — see below) per port on the hourly
+  `congestion_index` series and forecasts a configurable horizon (default
+  6 hours) with 80% confidence intervals.
+- **Honest about data sufficiency by design, not by afterthought**: it
+  refuses to fit and returns an explicit `insufficient_data` result (with
+  a stated reason) unless there are at least 48 hourly observations
+  *and* at least 80% hourly coverage over their time span (so a handful
+  of points scattered across weeks doesn't pass just because the raw
+  count is high enough). Two separate failure modes, both tested.
+- **Run against the real curated data** from Phase 3
+  (`python -m forecasting.run_forecast --curated /tmp/portpulse_curated`)
+  and it correctly reported `insufficient_data` for all 5 ports — real
+  history is currently 1-2 hourly observations per port (from the single
+  10-minute capture), nowhere near the 48-hour minimum. **No fake-looking
+  chart was produced**, exactly per the project brief. This is asserted
+  by an automated test, not just eyeballed once.
+- **Also run against a labeled-synthetic 96-hour series** (daily sine
+  pattern + noise, clearly not real data) to prove the "ok" forecast path
+  actually works end-to-end, not just in isolated unit tests. Real,
+  observed limitation worth noting: the forecast came back essentially
+  flat (~32 ± widening intervals) rather than tracking the injected daily
+  cycle — expected, since `order=(1,1,1)` has no seasonal term. Capturing
+  daily/weekly seasonality reliably needs several weeks of real history
+  (order of 336-504+ hourly points) to fit a seasonal order without
+  overfitting; upgrading the model once that much real data exists is a
+  documented next step, not something faked now.
+- 5 new unit tests, 58 total, all passing.
+
+**Not yet built:** dashboard (Phase 6), orchestration/monitoring
+(Phase 7), CloudFormation (Phase 8), teardown tooling (Phase 9).
 
 **About the sample data:** two files live in `ingestion/sample_data/`,
 and they are not interchangeable —
