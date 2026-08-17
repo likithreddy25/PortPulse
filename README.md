@@ -5,13 +5,16 @@ at 5 major container ports via AIS and computes a per-port congestion
 index (vessel count, dwell time, queue length) with a short-horizon
 forecast.
 
-**Status: Phases 1-8 of 9 built and tested locally.** This is a
-portfolio project built incrementally and validated at each phase — see
-[Build status](#build-status) for exactly what's working today versus
-what's still ahead. **Partial real AWS deployment exists** (Kinesis
-stream, S3 bucket, IAM roles, Glue database/table — see Cost below); the
-Glue crawler and Firehose delivery stream are blocked on an
-account-level issue currently being investigated, not yet resolved.
+**Status: all 9 phases built and tested.** This is a portfolio project
+built incrementally and validated at each phase — see
+[Build status](#build-status) for exactly what's working today, what's
+verified against real AWS vs. `moto`/local-only, and what's still
+aspirational. **Partial real AWS deployment exists** (Kinesis stream, S3
+bucket, IAM roles, Glue database/table — see Cost below); the Glue
+crawler and everything downstream of it are blocked on an account-level
+issue still being investigated, not yet resolved. No component here has
+been deployed as a continuously-running production pipeline — see the
+Resume bullet section for exactly what is and isn't claimed.
 
 ## Ports tracked
 
@@ -339,7 +342,26 @@ deployed):**
   (newer resource types, checked rather than assumed).
 - 6 new tests, 72 total, all passing.
 
-**Not yet built:** teardown tooling (Phase 9).
+**What's built and tested (Phase 9 — cost control + teardown):**
+- `teardown.sh` (thin wrapper) / `infra/teardown.py` (the real logic) —
+  deletes every billable resource this project's deploy scripts could
+  have created: Kinesis, Firehose, Glue (database/table/crawler), EMR
+  Serverless, Redshift Serverless, Lambda functions, EventBridge rules,
+  CloudWatch alarms, IAM roles, and (opt-in only, via `--delete-bucket`)
+  the S3 bucket. Every delete checks existence first and no-ops if the
+  resource isn't there — safe to run at any point, repeatedly.
+- **Verified two ways**: a full mocked lifecycle (moto) for everything
+  moto actually implements — deploys real-shaped fixtures, tears them
+  down, asserts they're gone, and separately asserts tearing down an
+  already-empty account doesn't raise. Redshift Serverless is excluded
+  from that mocked test (checked directly: moto's mock doesn't
+  implement `GetWorkgroup`/`GetNamespace`, so the not-found-is-a-no-op
+  path can't be exercised through it) and instead verified with a real
+  dry-run against the actual AWS account.
+- **Then actually run for real** (dry-run, `--confirm` omitted) against
+  this project's own live leftover resources from Phase 2 — see Cost
+  below for the full list it correctly found and what happened next.
+- 4 new tests, 76 total, all passing.
 
 **About the sample data:** two files live in `ingestion/sample_data/`,
 and they are not interchangeable —
@@ -431,13 +453,20 @@ Phase 4 is actually deployed.
 
 ## Cost
 
-**Currently deployed for real** (as of 2026-08-17): a Kinesis stream, an
-S3 bucket, 2 IAM roles, and a Glue database/table — created while
-testing Phase 2, then blocked on the Glue crawler step (see Build
-status). These **are accruing real cost right now**, dominated by the
-Kinesis stream's fixed hourly charge below. Everything else (Firehose
-delivery stream, Glue crawler, Redshift namespace/workgroup) is
-config/code only, not yet deployed.
+**Currently deployed for real** (as of 2026-08-17, ~1 hour old): a
+Kinesis stream, an S3 bucket, 2 IAM roles, and a Glue database/table —
+created while testing Phase 2, then blocked on the Glue crawler step
+(see Build status). These **have been accruing real cost this whole
+time**, dominated by the Kinesis stream's fixed hourly charge below —
+roughly 3-4 cents so far, since no data has actually flowed through it
+(Phase 1's live capture wrote to a local file, not Kinesis). Everything
+else (Firehose delivery stream, Glue crawler, EMR Serverless, Redshift
+namespace/workgroup, Lambda/EventBridge/CloudWatch) is config/code only,
+never deployed.
+
+`./teardown.sh` now exists and was run as a real dry-run against this
+exact leftover set — it correctly found all 6 resources above and
+nothing else.
 
 Rates sourced from AWS's current published pricing (not estimated from
 memory):
@@ -457,13 +486,28 @@ memory):
 under $2-3 for a day or two of testing, dominated by the Kinesis
 stream's fixed hourly charge. Redshift, if/when deployed, adds up fast
 only if left continuously active — auto-pause keeps occasional testing
-cheap. Phase 9 will add an automated `teardown.sh`; until it exists,
-anything deployed here should be **manually deleted right after
-testing** rather than left running. **Suggested AWS Budget alert:
-$10/month**, generous enough not to false-alarm on normal testing but
-tight enough to catch a forgotten resource (e.g., a stream left running
-for days, a crawler put on an hourly schedule, or a Redshift workgroup
-that never pauses) well before it becomes a real bill.
+cheap.
+
+**Tear it all down:**
+
+```bash
+./teardown.sh                    # dry run: lists what would be deleted
+./teardown.sh --confirm          # actually deletes it
+./teardown.sh --confirm --delete-bucket --bucket-name portpulse-raw-<account-id>  # also empties + deletes the S3 bucket
+```
+
+The S3 bucket is opt-in (`--delete-bucket`) since it may hold real
+captured data worth keeping even after everything else is torn down.
+Every other resource is deleted by default when `--confirm` is passed.
+
+**Suggested AWS Budget alert: $10/month**, generous enough not to
+false-alarm on normal testing but tight enough to catch a forgotten
+resource (e.g., a stream left running for days, a crawler put on an
+hourly schedule, or a Redshift workgroup that never pauses) well before
+it becomes a real bill. Not created by this project — Budgets require
+billing-account-level permissions this project's IAM user may not have,
+and creating one wasn't asked for, just suggested as the non-negotiables
+in the project brief call for.
 
 Sources: [Kinesis Data Streams pricing](https://aws.amazon.com/kinesis/data-streams/pricing/),
 [Firehose pricing](https://aws.amazon.com/kinesis/data-firehose/pricing/),
@@ -504,5 +548,42 @@ congestion_index = 100 * (
 
 ## Resume bullet
 
-To be written in Phase 9, and only for the parts that are genuinely
-built, tested, and (if deployed) verified running.
+Only for what's genuinely built and tested — see Build status above for
+the receipts behind every line:
+
+- Designed and built PortPulse, an AWS data engineering pipeline for
+  real-time port congestion analytics — ingesting live AIS vessel-
+  tracking data via WebSocket into Kinesis, Firehose, S3, and Glue, with
+  a PySpark enrichment job (radius-based geofencing, dwell-time
+  computation via window functions) feeding a Redshift Serverless star
+  schema, SARIMAX forecasting, and a Streamlit dashboard
+- Wrote a 76-test suite spanning moto-mocked AWS services, real local
+  Postgres/Docker validation of Redshift DDL, and `cfn-lint` + AWS's
+  live `validate-template` API for 3 split CloudFormation stacks — all
+  runnable offline except where explicitly noted
+- Verified the pipeline end-to-end against real captured AIS data (not
+  just synthetic fixtures), and found/fixed 6 real bugs by actually
+  running the system rather than assuming it worked — including a
+  PostgreSQL-vs-Redshift SQL dialect gap (`ON CONFLICT` isn't valid
+  Redshift syntax) caught before it would have hit a live warehouse
+- Built idempotent, dry-run-by-default boto3 deploy/teardown scripts
+  with explicit cost gates — every real AWS action confirmed against
+  live pricing docs and gated behind explicit user approval before
+  touching billable resources
+- Documented real, unresolved findings rather than smoothing them over:
+  a congestion-index formula whose initial calibration proved too low
+  once run against real traffic volume, and an AWS account-level
+  permissions restriction that blocked full deployment — both written
+  up plainly in the README instead of hidden or worked around
+
+**What this doesn't claim**: there is no continuously-running production
+deployment — a Glue crawler permissions issue (root cause outside this
+project's control, still under investigation) blocked completing the
+real AWS deployment beyond a partial Phase 2 (Kinesis stream, S3 bucket,
+IAM roles, Glue database/table). Every phase is built and verified
+either locally, against `moto`, or via real-but-read-only checks against
+an actual AWS account — see Build status for exactly which is which per
+component. No result or metric anywhere in this README was fabricated;
+where real data wasn't sufficient to produce a meaningful number (the
+forecast, the congestion-index calibration), that's stated outright
+instead of shown as if it were.

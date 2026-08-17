@@ -1,10 +1,12 @@
 # PortPulse Architecture
 
-Status: Phases 1-8 built and tested (locally, plus a partial real AWS
+Status: all 9 phases built and tested (locally, plus a partial real AWS
 deployment — Kinesis stream, S3 bucket, IAM roles, Glue database/table;
 see [README.md](../README.md#build-status) and #cost for exactly what's
-real vs. local-only). This doc describes the target end-state
-architecture; components not yet built are marked accordingly.
+real vs. local-only, and the Resume bullet section for what is and isn't
+claimed). This doc describes the target end-state architecture;
+components not yet deployed are marked accordingly even though all are
+now built and tested.
 
 ## Data flow
 
@@ -140,6 +142,20 @@ cross-cutting rather than part of the pipeline itself:
 `orchestration/deploy.py` creates all of the above, verified via a full
 mocked deployment (moto) and a real read-only dry-run against the actual
 AWS account -- see README Build status.
+
+## Cost control and teardown (Phase 9)
+
+`teardown.sh` / `infra/teardown.py` deletes every billable resource any
+deploy script in this project could have created (Kinesis, Firehose,
+Glue, EMR Serverless, Redshift Serverless, Lambda, EventBridge,
+CloudWatch, IAM roles; S3 bucket only with `--delete-bucket`). Every
+delete checks existence first, so it's safe and idempotent to run
+repeatedly or at any point in the project's life. Verified via a full
+mocked lifecycle (moto) for everything moto supports, and a real
+dry-run against the actual account for Redshift/EMR (which moto doesn't
+implement) -- see README Build status and Cost sections for the full
+detail, including what it found when actually run against this
+project's own leftover Phase 2 resources.
 
 ## IAM / security model
 
