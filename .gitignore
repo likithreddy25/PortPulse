@@ -5,7 +5,6 @@ __pycache__/
 venv/
 *.egg-info/
 .pytest_cache/
-ingestion/sample_data/captured_live.jsonl
 ingestion/sample_data/replayed_output.jsonl
 .DS_Store
 node_modules/

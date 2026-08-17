@@ -48,14 +48,30 @@ a SARIMAX forecast layered on top of the congestion time series.
   created and no AWS costs have been incurred.**
 - `ingestion/aisstream_client.py` — live WebSocket client for
   AISStream.io, built against their documented subscription/message
-  format. **Not yet run against the live feed** — that requires an
-  `AISSTREAM_API_KEY`, which is the user's to provide (see Setup below).
+  format. **Run live and verified**: connected to `wss://stream.aisstream.io/v0/stream`
+  with a real API key and captured a 10-minute sample
+  (`ingestion/sample_data/captured_live.jsonl`, committed to the repo) —
+  **2,717 real `PositionReport` messages from 1,167 distinct vessels.**
+  Per-port breakdown from that specific 10-minute window: NLRTM (Rotterdam)
+  1,933, USLAX (LA/Long Beach) 352, USNYC (NY/NJ) 284, SGSIN (Singapore)
+  148, **CNSHA (Shanghai) 0.** The Shanghai bounding box didn't see a
+  single position report in this window — worth watching once ingestion
+  runs continuously; could be terrestrial AIS receiver coverage gaps in
+  AISStream's free tier near Yangshan, or just this specific 10-minute
+  slice, not yet root-caused.
 - `ingestion/replay.py` — replays a recorded/sample JSONL file of raw
   AISStream messages through the same normalize → sink pipeline the live
-  client uses. **Verified working**: replaying the 240-message synthetic
-  fixture below produces 240 normalized records, correctly geofenced
-  across all 5 ports.
-- 16 unit tests, all passing, all offline (no network or AWS calls) —
+  client uses. **Verified working on both**: the 240-message synthetic
+  fixture (240/240 normalized, all 5 ports present, since it's synthetic)
+  and, more importantly, the real captured sample above (2,717/2,717
+  raw messages replayed to normalized records with no data loss).
+- Along the way, replaying the *first* live capture attempt caught a real
+  bug: the capture path was writing already-normalized records instead of
+  raw AISStream JSON, so `replay.py`'s normalize step silently produced
+  zero records. Fixed with an explicit `--raw` flag
+  (`ingestion/aisstream_client.py`) and covered by 3 new tests before
+  re-capturing.
+- 19 unit tests, all passing, all offline (no network or AWS calls) —
   run with `pytest tests/`.
 
 **Not yet built:** Firehose/S3/Glue (Phase 2), EMR enrichment (Phase 3),
@@ -63,13 +79,18 @@ Redshift (Phase 4), forecasting (Phase 5), dashboard (Phase 6),
 orchestration/monitoring (Phase 7), CloudFormation (Phase 8), teardown
 tooling (Phase 9).
 
-**About the sample data:** `ingestion/sample_data/synthetic_fixture.jsonl`
-is **synthetically generated** (see
-[`generate_synthetic_fixture.py`](ingestion/sample_data/generate_synthetic_fixture.py)),
-not real captured AIS traffic — it exists so the pipeline can be built
-and tested before a live feed is available. Once `AISSTREAM_API_KEY` is
-set, a real ~10-minute capture can be taken with the command in Setup
-below, and the replay mode works identically against it.
+**About the sample data:** two files live in `ingestion/sample_data/`,
+and they are not interchangeable —
+- `synthetic_fixture.jsonl` is **synthetically generated** (see
+  [`generate_synthetic_fixture.py`](ingestion/sample_data/generate_synthetic_fixture.py)),
+  not real AIS traffic. It existed so the pipeline could be built and
+  tested before a live feed/API key were available, and it's kept around
+  because it deterministically covers all 5 ports (the real capture, by
+  chance of timing, didn't).
+- `captured_live.jsonl` is a **real** ~10-minute capture from the live
+  AISStream.io feed (2,717 messages, 1,167 vessels, captured 2026-08-17
+  — see Build status above for the exact per-port breakdown). The exact
+  command used is in Setup below.
 
 ## Setup
 
@@ -97,9 +118,14 @@ Capture a real ~10-minute sample from the live feed once your API key is
 in `.env` (ask for confirmation before running this against the live feed):
 
 ```bash
-python -m ingestion.aisstream_client --sink file \
+python -m ingestion.aisstream_client --sink file --raw \
   --out ingestion/sample_data/captured_live.jsonl --max-seconds 600
 ```
+
+(`--raw` writes AISStream's raw JSON instead of normalized records --
+required because `replay.py` re-runs `normalize_message()` on read, so a
+recorded sample has to look like what the live feed actually sends, not
+the already-normalized output.)
 
 Then replay that real sample the same way:
 

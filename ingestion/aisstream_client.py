@@ -25,11 +25,19 @@ logger = logging.getLogger(__name__)
 
 class AISStreamClient:
     def __init__(self, api_key: str, sink: Sink, max_messages: Optional[int] = None,
-                 max_seconds: Optional[float] = None):
+                 max_seconds: Optional[float] = None, write_raw: bool = False):
         self.api_key = api_key
         self.sink = sink
         self.max_messages = max_messages
         self.max_seconds = max_seconds
+        # When True, writes AISStream's raw JSON to the sink instead of the
+        # normalized record. Used for --sink file captures that feed
+        # replay.py, which itself calls normalize_message() on read -- so
+        # the recorded sample needs to be raw, the same as what the live
+        # feed actually sends. Live production ingestion (sink=kinesis)
+        # should leave this False so Kinesis/Firehose/S3 downstream get
+        # the normalized schema directly.
+        self.write_raw = write_raw
         self._message_count = 0
 
     def _subscribe_payload(self) -> str:
@@ -56,11 +64,16 @@ class AISStreamClient:
                     logger.warning("Skipping non-JSON message")
                     continue
 
-                record = normalize_message(raw)
-                if record is None:
-                    continue
+                if self.write_raw:
+                    if raw.get("MessageType") != "PositionReport":
+                        continue
+                    self.sink.write(raw)
+                else:
+                    record = normalize_message(raw)
+                    if record is None:
+                        continue
+                    self.sink.write(record.to_dict())
 
-                self.sink.write(record.to_dict())
                 self._message_count += 1
 
                 if self.max_messages is not None and self._message_count >= self.max_messages:
@@ -99,6 +112,9 @@ async def _main() -> None:
     parser.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"))
     parser.add_argument("--max-messages", type=int, default=None)
     parser.add_argument("--max-seconds", type=float, default=None)
+    parser.add_argument("--raw", action="store_true",
+                         help="write AISStream's raw JSON instead of normalized records "
+                              "(use this for --sink file captures meant to feed replay.py)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -111,7 +127,8 @@ async def _main() -> None:
     else:
         sink = build_sink("kinesis", stream_name=args.stream_name, region_name=args.region)
 
-    client = AISStreamClient(api_key, sink, max_messages=args.max_messages, max_seconds=args.max_seconds)
+    client = AISStreamClient(api_key, sink, max_messages=args.max_messages, max_seconds=args.max_seconds,
+                              write_raw=args.raw)
     await client.run()
 
 
