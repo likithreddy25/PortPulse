@@ -85,7 +85,10 @@ access`. Ruled out: the deploying IAM user has `AdministratorAccess`
 (not a permissions problem), and the account isn't part of an AWS
 Organization (not an SCP). Likely an account-level restriction (the AWS
 account is under a month old) requiring either an AWS Support case or a
-Console-side check — being investigated by the project owner. Firehose
+Console-side check — still unresolved as of this writing. **The Kinesis
+stream, both IAM roles, and the Glue database/table have since been torn
+down for real** (`teardown.sh --confirm`, once Phases 1-9 were complete)
+-- only the empty S3 bucket remains. Firehose
 delivery stream creation hasn't been attempted yet since it comes after
 the crawler step in the deploy sequence.
 

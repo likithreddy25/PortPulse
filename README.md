@@ -9,12 +9,14 @@ forecast.
 built incrementally and validated at each phase — see
 [Build status](#build-status) for exactly what's working today, what's
 verified against real AWS vs. `moto`/local-only, and what's still
-aspirational. **Partial real AWS deployment exists** (Kinesis stream, S3
-bucket, IAM roles, Glue database/table — see Cost below); the Glue
-crawler and everything downstream of it are blocked on an account-level
-issue still being investigated, not yet resolved. No component here has
-been deployed as a continuously-running production pipeline — see the
-Resume bullet section for exactly what is and isn't claimed.
+aspirational. **Nothing is currently deployed to AWS except one empty S3
+bucket** — a partial Phase 2 deployment (Kinesis stream, IAM roles, Glue
+database/table) ran for about an hour, then was torn down for real with
+`teardown.sh` once Phases 1-9 were complete (see Cost below). The Glue
+crawler and everything downstream of it were blocked on an
+account-level issue that's still unresolved. No component here has been
+deployed as a continuously-running production pipeline — see the Resume
+bullet section for exactly what is and isn't claimed.
 
 ## Ports tracked
 
@@ -358,9 +360,14 @@ deployed):**
   implement `GetWorkgroup`/`GetNamespace`, so the not-found-is-a-no-op
   path can't be exercised through it) and instead verified with a real
   dry-run against the actual AWS account.
-- **Then actually run for real** (dry-run, `--confirm` omitted) against
-  this project's own live leftover resources from Phase 2 — see Cost
-  below for the full list it correctly found and what happened next.
+- **Then actually run for real, twice**: first a dry-run against this
+  project's own live leftover Phase 2 resources (correctly found exactly
+  the 6 that existed and nothing else), then `--confirm` for real —
+  deleting the Kinesis stream, both IAM roles, and the Glue database/
+  table, verified afterward by directly querying AWS and confirming
+  `ResourceNotFoundException`/`NoSuchEntity` for all four. The S3 bucket
+  was deliberately left alone (`--delete-bucket` not passed) — see Cost
+  below for the full before/after.
 - 4 new tests, 76 total, all passing.
 
 **About the sample data:** two files live in `ingestion/sample_data/`,
@@ -453,20 +460,20 @@ Phase 4 is actually deployed.
 
 ## Cost
 
-**Currently deployed for real** (as of 2026-08-17, ~1 hour old): a
-Kinesis stream, an S3 bucket, 2 IAM roles, and a Glue database/table —
-created while testing Phase 2, then blocked on the Glue crawler step
-(see Build status). These **have been accruing real cost this whole
-time**, dominated by the Kinesis stream's fixed hourly charge below —
-roughly 3-4 cents so far, since no data has actually flowed through it
-(Phase 1's live capture wrote to a local file, not Kinesis). Everything
-else (Firehose delivery stream, Glue crawler, EMR Serverless, Redshift
-namespace/workgroup, Lambda/EventBridge/CloudWatch) is config/code only,
-never deployed.
+**Currently deployed for real (as of 2026-08-17): nothing except one
+empty S3 bucket.** The Kinesis stream, 2 IAM roles, and Glue database/
+table created while testing Phase 2 ran for about an hour (total cost:
+roughly 3-4 cents, since no data ever actually flowed through the
+stream — Phase 1's live capture wrote to a local file, not Kinesis) and
+have since been **torn down for real** with `./teardown.sh --confirm`,
+verified by directly querying AWS afterward and confirming
+`ResourceNotFoundException`/`NoSuchEntity` for all four. The S3 bucket
+(`portpulse-raw-<account-id>`) was deliberately left alone (opt-in via
+`--delete-bucket`, not passed) — it's empty, holds nothing.
 
-`./teardown.sh` now exists and was run as a real dry-run against this
-exact leftover set — it correctly found all 6 resources above and
-nothing else.
+Everything else in this project (Firehose delivery stream, Glue
+crawler, EMR Serverless, Redshift namespace/workgroup, Lambda/
+EventBridge/CloudWatch) was never deployed at all — config/code only.
 
 Rates sourced from AWS's current published pricing (not estimated from
 memory):
