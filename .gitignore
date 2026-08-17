@@ -6,6 +6,7 @@ venv/
 *.egg-info/
 .pytest_cache/
 ingestion/sample_data/replayed_output.jsonl
+streaming/local_preview_output/
 .DS_Store
 node_modules/
 dashboard/build/

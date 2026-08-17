@@ -1,8 +1,9 @@
 # PortPulse Architecture
 
-Status: Phase 1 of 9 built (see [README.md](../README.md#build-status)).
-This doc describes the target end-state architecture; components not yet
-built are marked accordingly.
+Status: Phases 1-2 built and locally validated, not yet deployed to real
+AWS (see [README.md](../README.md#build-status)). This doc describes the
+target end-state architecture; components not yet built are marked
+accordingly.
 
 ## Data flow
 
@@ -13,16 +14,18 @@ AISStream.io (WebSocket)
 [Phase 1 - BUILT] Python WebSocket client (ingestion/aisstream_client.py)
       | normalizes: MMSI, lat, lon, speed, course, timestamp, port_zone
       v
-[Phase 1 - BUILT] Kinesis Data Stream (on-demand, single stream)
+[Phase 1 - config/code built, NOT deployed] Kinesis Data Stream (on-demand, single stream)
       |
       v
-[Phase 2 - NOT BUILT] Kinesis Data Firehose
-      | batches, converts to Parquet
+[Phase 2 - config/code built + locally validated, NOT deployed] Kinesis Data Firehose
+      | batches, converts to Parquet, dynamic-partitions by port_zone/date/hour
+      | (see README Build status: the Parquet+dynamic-partitioning combo is
+      | unverified against real AWS; tested fallback config exists)
       v
-[Phase 2 - NOT BUILT] S3 raw zone (partitioned by port/date/hour)
+[Phase 2 - locally proven via streaming/local_preview.py] S3 raw zone (partitioned by port/date/hour)
       |
       v
-[Phase 2 - NOT BUILT] Glue Crawler -> Glue Data Catalog
+[Phase 2 - config built, NOT deployed] Glue Crawler -> Glue Data Catalog
       |
       v
 [Phase 3 - NOT BUILT] EMR Serverless PySpark job (hourly, via EventBridge)

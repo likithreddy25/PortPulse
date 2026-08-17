@@ -74,10 +74,40 @@ a SARIMAX forecast layered on top of the congestion time series.
 - 19 unit tests, all passing, all offline (no network or AWS calls) —
   run with `pytest tests/`.
 
-**Not yet built:** Firehose/S3/Glue (Phase 2), EMR enrichment (Phase 3),
-Redshift (Phase 4), forecasting (Phase 5), dashboard (Phase 6),
-orchestration/monitoring (Phase 7), CloudFormation (Phase 8), teardown
-tooling (Phase 9).
+**What's built and locally tested (Phase 2, not yet deployed to real AWS):**
+- `streaming/table_schema.py` — single source of truth for the raw table
+  schema (mmsi, lat, lon, speed_knots, course_deg, timestamp, port_zone,
+  ship_name, nav_status), consumed by both the Glue table definition and
+  the local Parquet writer, so they can't drift apart.
+- `streaming/local_preview.py` — a local stand-in for what Firehose+Glue
+  do in production: reads a JSONL sample, partitions by
+  `port_zone/date/hour`, writes real Parquet files. **Verified against
+  the real captured sample**: all 2,717 records converted and
+  partitioned correctly (6 partitions, e.g. `port_zone=NLRTM/date=2026-08-17/hour=15`
+  with 1,930 rows), schema round-trips cleanly through pyarrow.
+- `streaming/firehose_config.py`, `streaming/glue_catalog_config.py` —
+  the real Firehose delivery stream and Glue database/table/crawler
+  configs. **Open question, documented in the code, not hidden**: AWS's
+  docs don't clearly confirm whether a single Firehose delivery stream
+  can combine Parquet format conversion with dynamic (content-based)
+  partitioning — checked multiple doc pages, found no definitive answer
+  either way. A tested fallback config (dynamic partitioning only, raw
+  gzip JSON, Parquet conversion deferred to Phase 3's EMR job) is ready
+  if AWS's API rejects the combined config on first real deploy.
+- `streaming/deploy.py` — the boto3 script that would create the real
+  resources (Kinesis stream, S3 bucket, IAM roles, Glue database/table/
+  crawler, Firehose delivery stream). **Verified two ways**: a full
+  mocked deployment (via `moto`) exercises every function end-to-end
+  including idempotent re-runs, and a real dry-run (`--region us-east-1`,
+  no `--confirm`) against the actual AWS account confirmed the plan
+  resolves correctly and **created nothing** (every check is a read-only
+  `describe`/`head`/`get` call). Actually creating these resources
+  (the `--confirm` flag) has not been run — see Cost below.
+- 31 unit tests total, all passing, all offline (no real AWS calls).
+
+**Not yet built:** EMR enrichment (Phase 3), Redshift (Phase 4),
+forecasting (Phase 5), dashboard (Phase 6), orchestration/monitoring
+(Phase 7), CloudFormation (Phase 8), teardown tooling (Phase 9).
 
 **About the sample data:** two files live in `ingestion/sample_data/`,
 and they are not interchangeable —
@@ -135,11 +165,34 @@ python -m ingestion.replay --sample ingestion/sample_data/captured_live.jsonl --
 
 ## Cost
 
-Phase 1 has zero AWS cost — everything above runs locally. A cost
-estimate for the full deployed pipeline (Kinesis, Firehose, EMR
-Serverless, Redshift Serverless, S3) will be documented here once later
-phases are built and a teardown script exists (Phase 9), before anything
-is actually deployed.
+Nothing has been deployed to real AWS yet — everything above runs
+locally or against `moto`. Here's what deploying Phase 1+2
+(`streaming/deploy.py --confirm`) would actually cost, sourced from
+AWS's current published pricing (not estimated from memory):
+
+| Resource | Rate | Notes |
+|---|---|---|
+| Kinesis Data Stream (on-demand) | **$0.04/stream-hour** (~$28.80/mo) + $0.08/GB ingested + $0.04/GB retrieved | **This is the one fixed cost that accrues just for the stream existing**, independent of traffic. Everything else below is usage-based and negligible at our data volume (a few thousand small messages/hour). |
+| Firehose ingestion | $0.029/GB | rounded up to 5KB/record |
+| Firehose format conversion (Parquet) | $0.018/GB | if the combined config works (see Build status) |
+| Firehose dynamic partitioning | $0.02/GB + $0.005/1,000 objects, +$0.07/JQ-processing-hour | usage-based |
+| S3 storage | ~$0.023/GB/month | negligible — our raw data is megabytes, not gigabytes |
+| Glue crawler | $0.44/DPU-hour, 1-min minimum | a few cents per manual run; not scheduled yet (that's Phase 7) |
+| Glue Data Catalog | free under 1M objects/1M requests | nowhere close at this scale |
+
+**Bottom line:** running Phase 1+2 for a day or two of testing is well
+under $2-3 total, dominated by the Kinesis stream's fixed hourly charge.
+Phase 9 will add an automated `teardown.sh`; until it exists, anything
+deployed here should be **manually deleted right after testing** rather
+than left running. **Suggested AWS Budget alert: $10/month**, generous
+enough not to false-alarm on normal testing but tight enough to catch a
+forgotten resource (e.g., a stream left running for days, or a crawler
+accidentally put on an hourly schedule) well before it becomes a real
+bill.
+
+Sources: [Kinesis Data Streams pricing](https://aws.amazon.com/kinesis/data-streams/pricing/),
+[Firehose pricing](https://aws.amazon.com/kinesis/data-firehose/pricing/),
+[Glue pricing](https://aws.amazon.com/glue/pricing/).
 
 ## Congestion index formula
 
