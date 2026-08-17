@@ -5,7 +5,7 @@ at 5 major container ports via AIS and computes a per-port congestion
 index (vessel count, dwell time, queue length) with a short-horizon
 forecast.
 
-**Status: Phases 1-6 of 9 built and tested locally.** This is a
+**Status: Phases 1-7 of 9 built and tested locally.** This is a
 portfolio project built incrementally and validated at each phase — see
 [Build status](#build-status) for exactly what's working today versus
 what's still ahead. **Partial real AWS deployment exists** (Kinesis
@@ -271,8 +271,45 @@ to real AWS):**
 Run it: `streamlit run dashboard/app.py` (needs the Phase 3 curated
 Parquet at `/tmp/portpulse_curated` for demo mode — see Setup).
 
-**Not yet built:** orchestration/monitoring (Phase 7), CloudFormation
-(Phase 8), teardown tooling (Phase 9).
+**What's built and tested (Phase 7 — orchestration + monitoring, not
+deployed):**
+- `orchestration/trigger_emr_job.py` — Lambda handler, triggered hourly,
+  starts an EMR Serverless job run of `batch/emr_jobs/pipeline.py`.
+  **Not runnable for real yet** — no EMR Serverless application has been
+  created (Phase 3 only runs the same pipeline locally). Application ID
+  and role ARN come from environment variables so the same handler code
+  works once Phase 8's CloudFormation creates the real application.
+- `orchestration/check_freshness.py` — Lambda handler, triggered every 15
+  minutes, queries Redshift for the newest curated row and publishes a
+  `PortPulse/CuratedFreshnessMinutes` custom CloudWatch metric. Handles
+  the empty-table case explicitly (reports a large finite staleness
+  value rather than skipping the metric, so the alarm can actually
+  evaluate it instead of silently having no data point).
+- `orchestration/deploy.py` — creates both Lambda functions, an IAM role,
+  two EventBridge schedule rules, and two CloudWatch alarms:
+  - `FailedConversion.Records >= 1` (Firehose format-conversion
+    failures) — checked against AWS's real metric docs and chosen over
+    `DeliveryToS3.Success` as the primary signal because that one is
+    ambiguous (AWS's own docs call it a "sum" but it's commonly alarmed
+    on as a 0-1 ratio in AWS's examples — not resolved without a real
+    running stream to observe, so not relied on here, documented rather
+    than guessed).
+  - `CuratedFreshnessMinutes > 90` for 2 consecutive periods (the "no new
+    hourly row in >90 min" alarm from the project brief).
+  - **Caught a real bug writing this**: the alarm's Firehose dimension
+    defaulted to the *Kinesis* stream name (`portpulse-ais-positions`)
+    instead of the *Firehose delivery stream* name (`portpulse-ais-raw`)
+    — two different real resources with similar names. Fixed before it
+    shipped, not after being wrong in production.
+- **Verified two ways**, same pattern as every other deploy script here:
+  a full mocked deployment (`moto`) exercises Lambda/EventBridge/
+  CloudWatch end-to-end including idempotent re-runs, and a real dry-run
+  against the actual AWS account confirmed the plan resolves correctly,
+  creating nothing.
+- 6 new tests (Lambda handler logic tested via dependency-injected mock
+  clients, not a real Lambda runtime), 66 total, all passing.
+
+**Not yet built:** CloudFormation (Phase 8), teardown tooling (Phase 9).
 
 **About the sample data:** two files live in `ingestion/sample_data/`,
 and they are not interchangeable —

@@ -1,6 +1,6 @@
 # PortPulse Architecture
 
-Status: Phases 1-6 built and tested (locally, plus a partial real AWS
+Status: Phases 1-7 built and tested (locally, plus a partial real AWS
 deployment — Kinesis stream, S3 bucket, IAM roles, Glue database/table;
 see [README.md](../README.md#build-status) and #cost for exactly what's
 real vs. local-only). This doc describes the target end-state
@@ -109,6 +109,24 @@ AISStream's `PositionReport` message type, not `ShipStaticData` (where
 AIS actually reports vessel type). Capturing that and mapping MMSI ->
 vessel_type_id would be the natural next step to make the dimension
 actually used rather than a populated-but-unreferenced reference table.
+
+## Orchestration and monitoring
+
+Not shown in the linear data-flow diagram above since these are
+cross-cutting rather than part of the pipeline itself:
+- **EventBridge (hourly)** -> Lambda (`orchestration/trigger_emr_job.py`)
+  -> EMR Serverless `StartJobRun`. Not runnable for real yet -- no EMR
+  Serverless application exists.
+- **EventBridge (every 15 min)** -> Lambda
+  (`orchestration/check_freshness.py`) -> queries Redshift for the
+  newest curated row -> publishes `PortPulse/CuratedFreshnessMinutes` to
+  CloudWatch. Not runnable for real yet -- Redshift isn't deployed.
+- **CloudWatch alarms**: Firehose `FailedConversion.Records >= 1`, and
+  `CuratedFreshnessMinutes > 90` for 2 consecutive periods.
+
+`orchestration/deploy.py` creates all of the above, verified via a full
+mocked deployment (moto) and a real read-only dry-run against the actual
+AWS account -- see README Build status.
 
 ## IAM / security model
 
