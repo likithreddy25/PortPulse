@@ -5,10 +5,13 @@ at 5 major container ports via AIS and computes a per-port congestion
 index (vessel count, dwell time, queue length) with a short-horizon
 forecast.
 
-**Status: Phase 1 of 9 complete.** This is a portfolio project built
-incrementally and validated at each phase — see [Build status](#build-status)
-for exactly what's working today versus what's still ahead. Nothing here
-is deployed to AWS yet.
+**Status: Phases 1-3 of 9 built and tested locally.** This is a
+portfolio project built incrementally and validated at each phase — see
+[Build status](#build-status) for exactly what's working today versus
+what's still ahead. **Partial real AWS deployment exists** (Kinesis
+stream, S3 bucket, IAM roles, Glue database/table — see Cost below); the
+Glue crawler and Firehose delivery stream are blocked on an
+account-level issue currently being investigated, not yet resolved.
 
 ## Ports tracked
 
@@ -105,9 +108,62 @@ a SARIMAX forecast layered on top of the congestion time series.
   (the `--confirm` flag) has not been run — see Cost below.
 - 31 unit tests total, all passing, all offline (no real AWS calls).
 
-**Not yet built:** EMR enrichment (Phase 3), Redshift (Phase 4),
-forecasting (Phase 5), dashboard (Phase 6), orchestration/monitoring
-(Phase 7), CloudFormation (Phase 8), teardown tooling (Phase 9).
+**What's built and tested (Phase 3 — EMR/Spark enrichment, run locally,
+not yet pointed at EMR Serverless):**
+- `batch/emr_jobs/geofence.py` — radius-based anchorage geofencing
+  (haversine distance, 20km radius from each port's center point — see
+  the module docstring for why 20km and its limitations).
+- `batch/emr_jobs/dwell.py` — PySpark transformation that groups each
+  vessel's consecutive in-zone position reports into "visits" (a
+  standard gaps-and-islands technique over a window function) and
+  computes dwell time per visit, correctly distinguishing *completed*
+  visits (vessel later observed leaving) from *still-open* ones (vessel's
+  last known position is still inside the zone).
+- `batch/emr_jobs/congestion.py` — hourly curated aggregation
+  (vessel_count, queue_length, avg_dwell_time_hours) and the
+  congestion_index formula, **explicitly documented** in that module's
+  docstring: a weighted sum of three capped/normalized components
+  (0.4 weight on dwell time, 0.3 each on vessel count and queue length),
+  with the caps stated as reasonable starting assumptions rather than
+  values derived from historical data (there isn't any yet).
+- 15 new unit tests (synthetic multi-vessel, multi-hour scenarios run
+  against a real local Spark session) verifying: geofencing distances,
+  correct completed-vs-open visit classification, correct hour-bucket
+  assignment for dwell time, and the congestion_index formula matching
+  its documented definition exactly. 44 tests total, all passing.
+- **Run against the real captured sample** (`ingestion/sample_data/captured_live.jsonl`,
+  replayed and fed through `batch.emr_jobs.pipeline`) and it produced
+  real, honest, and slightly humbling results:
+  - `avg_dwell_time_hours` came back essentially null/zero for every
+    port. This is expected and correct, not a bug: the capture window
+    is 10 minutes, and no real vessel completes an anchorage visit that
+    fast. A couple of near-zero values (~1-10 microseconds) showed up
+    from vessels with two AIS reports milliseconds apart flipping zone
+    status right at the 20km boundary — a real data-quality nuance in
+    raw AIS, not something the pipeline mishandled.
+  - `vessel_count` and `queue_length` came back **far higher than
+    expected** for busy ports — Rotterdam alone showed 401 distinct
+    vessels and 339 of them under 1 knot within a single hour. High
+    enough to saturate both component caps (VESSEL_COUNT_CAP=40,
+    QUEUE_LENGTH_CAP=25), which is why `congestion_index` pinned at
+    60.0 for 4 of the 5 ports rather than showing meaningful spread.
+    Documented rather than quietly adjusted: this is a real signal that
+    (a) the caps need real historical data to calibrate properly, and
+    (b) a single 20km-radius circle around one port center point
+    doesn't distinguish vessels genuinely queued at anchor from vessels
+    already docked/moored at a berth inside a busy harbor complex like
+    Rotterdam's — both look like "in zone, low speed." Worth revisiting
+    with tighter, port-specific anchorage boundaries if real port
+    authority data becomes available.
+  - **Bottom line: the computation logic is verified correct (via unit
+    tests); the specific congestion_index numbers produced from this
+    10-minute real sample are not meaningful port congestion
+    measurements** — they're a byproduct of too short a window and
+    uncalibrated caps, not a finished analytical result.
+
+**Not yet built:** Redshift (Phase 4), forecasting (Phase 5), dashboard
+(Phase 6), orchestration/monitoring (Phase 7), CloudFormation (Phase 8),
+teardown tooling (Phase 9).
 
 **About the sample data:** two files live in `ingestion/sample_data/`,
 and they are not interchangeable —
@@ -163,6 +219,29 @@ Then replay that real sample the same way:
 python -m ingestion.replay --sample ingestion/sample_data/captured_live.jsonl --sink stdout
 ```
 
+Run the local Parquet + port/date/hour partitioning preview (stands in
+for Firehose+Glue, no AWS needed):
+
+```bash
+python -m streaming.local_preview --sample ingestion/sample_data/captured_live.jsonl \
+  --out streaming/local_preview_output/raw
+```
+
+Run the Spark enrichment job locally (needs a JDK — see note below —
+and the normalized JSONL from a replay run above, not the raw capture):
+
+```bash
+export JAVA_HOME=/opt/homebrew/opt/openjdk@17   # or wherever your JDK 17 lives
+python -m ingestion.replay --sample ingestion/sample_data/captured_live.jsonl \
+  --sink file --out /tmp/normalized_live.jsonl
+python -m batch.emr_jobs.pipeline --input /tmp/normalized_live.jsonl \
+  --output /tmp/portpulse_curated --input-format json
+```
+
+PySpark needs a real JDK (8, 11, or 17) on the machine — it's not a pip
+install away. On macOS: `brew install openjdk@17`, then point
+`JAVA_HOME` at it as shown above (no need to symlink it system-wide).
+
 ## Cost
 
 Nothing has been deployed to real AWS yet — everything above runs
@@ -196,8 +275,35 @@ Sources: [Kinesis Data Streams pricing](https://aws.amazon.com/kinesis/data-stre
 
 ## Congestion index formula
 
-To be defined and documented here in Phase 3, once the EMR enrichment
-job that computes it exists.
+Computed per port, per hour, in [`batch/emr_jobs/congestion.py`](batch/emr_jobs/congestion.py)
+(full rationale in that file's docstring). `congestion_index` ranges 0-100:
+
+```
+congestion_index = 100 * (
+    0.3 * min(vessel_count / 40, 1.0) +
+    0.4 * min(avg_dwell_time_hours / 48, 1.0) +
+    0.3 * min(queue_length / 25, 1.0)
+)
+```
+
+- **vessel_count**: distinct vessels observed inside the port's 20km
+  anchorage radius during that hour.
+- **queue_length**: of those, how many were moving under 1 knot (i.e.
+  actually queued/stationary, not just transiting through).
+- **avg_dwell_time_hours**: average duration of anchorage *visits that
+  concluded* during that hour (entry time to last-observed-in-zone time,
+  for vessels later seen leaving — see `batch/emr_jobs/dwell.py`).
+- **Weights** (0.4 dwell / 0.3 vessel count / 0.3 queue length): dwell
+  time gets the highest weight because it's the most direct signal of
+  actual delay; the other two are weighted equally as volume/backlog
+  signals.
+- **Caps** (40 vessels / 48 hours / 25 queued vessels) are the values
+  each component saturates at (contributes its full weight). They're
+  **documented starting assumptions, not derived from historical data**
+  — there isn't enough yet. Running the real captured sample through
+  this formula showed the vessel/queue caps are likely too low for busy
+  ports (see Build status above) — a concrete, honest reason to
+  recalibrate once real hourly history accumulates, not a hidden flaw.
 
 ## Resume bullet
 

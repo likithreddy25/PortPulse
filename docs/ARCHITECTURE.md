@@ -1,9 +1,10 @@
 # PortPulse Architecture
 
-Status: Phases 1-2 built and locally validated, not yet deployed to real
-AWS (see [README.md](../README.md#build-status)). This doc describes the
-target end-state architecture; components not yet built are marked
-accordingly.
+Status: Phases 1-3 built and tested (locally, plus a partial real AWS
+deployment — Kinesis stream, S3 bucket, IAM roles, Glue database/table;
+see [README.md](../README.md#build-status) and #cost for exactly what's
+real vs. local-only). This doc describes the target end-state
+architecture; components not yet built are marked accordingly.
 
 ## Data flow
 
@@ -14,24 +15,26 @@ AISStream.io (WebSocket)
 [Phase 1 - BUILT] Python WebSocket client (ingestion/aisstream_client.py)
       | normalizes: MMSI, lat, lon, speed, course, timestamp, port_zone
       v
-[Phase 1 - config/code built, NOT deployed] Kinesis Data Stream (on-demand, single stream)
+[Phase 1 - REAL: Kinesis stream "portpulse-ais-positions" exists in AWS, empty] Kinesis Data Stream (on-demand, single stream)
       |
       v
-[Phase 2 - config/code built + locally validated, NOT deployed] Kinesis Data Firehose
+[Phase 2 - config/code built + locally validated, delivery stream NOT created] Kinesis Data Firehose
       | batches, converts to Parquet, dynamic-partitions by port_zone/date/hour
       | (see README Build status: the Parquet+dynamic-partitioning combo is
-      | unverified against real AWS; tested fallback config exists)
+      | unverified against real AWS; tested fallback config exists; also
+      | blocked behind the Glue crawler AccessDenied issue below)
       v
-[Phase 2 - locally proven via streaming/local_preview.py] S3 raw zone (partitioned by port/date/hour)
+[Phase 2 - locally proven via streaming/local_preview.py; real S3 bucket exists, empty] S3 raw zone (partitioned by port/date/hour)
       |
       v
-[Phase 2 - config built, NOT deployed] Glue Crawler -> Glue Data Catalog
+[Phase 2 - REAL: Glue database + table exist; Crawler creation blocked by an account-level AccessDeniedException, under investigation] Glue Crawler -> Glue Data Catalog
       |
       v
-[Phase 3 - NOT BUILT] EMR Serverless PySpark job (hourly, via EventBridge)
-      | geofencing (anchorage radius), dwell time, congestion_index
+[Phase 3 - BUILT + unit tested + run locally against real captured data] EMR Serverless PySpark job (hourly, via EventBridge)
+      | geofencing (20km anchorage radius), dwell time, congestion_index
+      | -- not yet pointed at real EMR Serverless, only local Spark
       v
-[Phase 3 - NOT BUILT] S3 curated zone (Parquet)
+[Phase 3 - BUILT: writes local Parquet partitioned by port_id, not yet S3] S3 curated zone (Parquet)
       |
       v
 [Phase 4 - NOT BUILT] Redshift Serverless (COPY load)
@@ -57,10 +60,31 @@ Two layers, deliberately different levels of precision:
 1. **Ingestion-time (Phase 1, built):** coarse bounding-box check
    (`ingestion/geofence.py`) — just tags which of the 5 port boxes a
    position falls in, using the same boxes AISStream is subscribed to.
-2. **Enrichment-time (Phase 3, not built):** radius-based distance from
+2. **Enrichment-time (Phase 3, built):** radius-based distance
+   (`batch/emr_jobs/geofence.py`, 20km from each port's center) from
    each port's anchorage center, used to detect zone-entry/zone-exit
    events for dwell-time computation. This is the layer the
-   congestion_index formula will actually depend on.
+   congestion_index formula actually depends on. **Known limitation,
+   found by running against real data**: a single 20km circle around one
+   center point doesn't distinguish vessels genuinely queued at anchor
+   from vessels already docked at a berth inside a busy harbor complex
+   (Rotterdam showed 401 vessels/hour, 339 of them "queued" by this
+   definition) — see README Build status for the full writeup. Worth
+   revisiting with tighter, port-specific anchorage boundaries if real
+   port authority geometry becomes available.
+
+## Deployment blocker (as of 2026-08-17)
+
+`streaming/deploy.py --confirm` successfully created the Kinesis stream,
+S3 bucket, both IAM roles, and the Glue database/table, then failed on
+`glue:CreateCrawler` with `AccessDeniedException: Account ... is denied
+access`. Ruled out: the deploying IAM user has `AdministratorAccess`
+(not a permissions problem), and the account isn't part of an AWS
+Organization (not an SCP). Likely an account-level restriction (the AWS
+account is under a month old) requiring either an AWS Support case or a
+Console-side check — being investigated by the project owner. Firehose
+delivery stream creation hasn't been attempted yet since it comes after
+the crawler step in the deploy sequence.
 
 ## IAM / security model
 
