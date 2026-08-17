@@ -1,0 +1,162 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PortPulse processing stack: EMR Serverless application + the hourly
+  EventBridge-triggered Lambda that starts enrichment job runs. Depends
+  on outputs from ingestion.yaml (raw bucket). NOT DEPLOYED -- validated
+  with `aws cloudformation validate-template` only. The EMR Serverless
+  application itself has never been created in any form (unlike Kinesis/
+  S3/Glue in ingestion.yaml, which were actually created via
+  streaming/deploy.py's boto3 calls before hitting the Glue crawler
+  blocker) -- see README Build status.
+
+Parameters:
+  RawBucketArn:
+    Type: String
+    Description: From ingestion.yaml's RawBucketArn output
+  RawBucketName:
+    Type: String
+    Description: From ingestion.yaml's RawBucketName output
+  PipelineScriptS3Path:
+    Type: String
+    Description: s3:// path where batch/emr_jobs/pipeline.py has been uploaded (not automated by this stack)
+    Default: "s3://REPLACE-ME/pipeline.py"
+
+Resources:
+  EmrApplication:
+    Type: AWS::EMRServerless::Application
+    Properties:
+      Name: portpulse-enrichment
+      Type: SPARK
+      ReleaseLabel: emr-7.1.0
+      AutoStopConfiguration:
+        Enabled: true
+        IdleTimeoutMinutes: 15  # cost control: shut down quickly between hourly runs
+
+  EmrExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: portpulse-emr-execution-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: emr-serverless.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: portpulse-emr-execution-inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource:
+                  - !Ref RawBucketArn
+                  - !Sub "${RawBucketArn}/*"
+              - Effect: Allow
+                Action: [glue:GetDatabase, glue:GetTable, glue:GetPartitions]
+                Resource: "*"
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: "*"
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: portpulse-trigger-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: portpulse-trigger-lambda-inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: "*"
+              - Effect: Allow
+                Action: [emr-serverless:StartJobRun]
+                Resource: !GetAtt EmrApplication.Arn
+
+  # Inline source, kept identical to orchestration/trigger_emr_job.py.
+  # CloudFormation's inline ZipFile always names the file "index.py",
+  # which is why Handler below is "index.handler" rather than
+  # "trigger_emr_job.handler" (the name used when this same code runs
+  # locally / is deployed via orchestration/deploy.py's zip packaging).
+  TriggerEmrJobFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: portpulse-trigger-emr-job
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          EMR_SERVERLESS_APPLICATION_ID: !GetAtt EmrApplication.ApplicationId
+          EMR_EXECUTION_ROLE_ARN: !GetAtt EmrExecutionRole.Arn
+          CURATED_INPUT_PATH: !Sub "s3://${RawBucketName}/raw/"
+          CURATED_OUTPUT_PATH: !Sub "s3://${RawBucketName}/curated/"
+          PIPELINE_SCRIPT_S3_PATH: !Ref PipelineScriptS3Path
+      Code:
+        ZipFile: |
+          import os
+          from typing import Any, Optional
+
+
+          def handler(event: dict, context: Any, emr_client: Optional[Any] = None) -> dict:
+              if emr_client is None:
+                  import boto3
+                  emr_client = boto3.client("emr-serverless")
+
+              application_id = os.environ["EMR_SERVERLESS_APPLICATION_ID"]
+              execution_role_arn = os.environ["EMR_EXECUTION_ROLE_ARN"]
+              input_path = os.environ["CURATED_INPUT_PATH"]
+              output_path = os.environ["CURATED_OUTPUT_PATH"]
+              script_path = os.environ["PIPELINE_SCRIPT_S3_PATH"]
+
+              response = emr_client.start_job_run(
+                  applicationId=application_id,
+                  executionRoleArn=execution_role_arn,
+                  jobDriver={
+                      "sparkSubmit": {
+                          "entryPoint": script_path,
+                          "entryPointArguments": [
+                              "--input", input_path,
+                              "--output", output_path,
+                              "--input-format", "parquet",
+                          ],
+                          "sparkSubmitParameters": "--conf spark.executor.cores=2 --conf spark.executor.memory=4g",
+                      }
+                  },
+                  name="portpulse-hourly-enrichment",
+              )
+              return {"jobRunId": response["jobRunId"], "applicationId": application_id}
+
+  HourlyTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: portpulse-hourly-emr-trigger
+      ScheduleExpression: rate(1 hour)
+      State: ENABLED
+      Targets:
+        - Id: "1"
+          Arn: !GetAtt TriggerEmrJobFunction.Arn
+
+  HourlyTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TriggerEmrJobFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HourlyTriggerRule.Arn
+
+Outputs:
+  EmrApplicationId:
+    Value: !GetAtt EmrApplication.ApplicationId
+  EmrExecutionRoleArn:
+    Value: !GetAtt EmrExecutionRole.Arn

@@ -1,6 +1,6 @@
 # PortPulse Architecture
 
-Status: Phases 1-7 built and tested (locally, plus a partial real AWS
+Status: Phases 1-8 built and tested (locally, plus a partial real AWS
 deployment — Kinesis stream, S3 bucket, IAM roles, Glue database/table;
 see [README.md](../README.md#build-status) and #cost for exactly what's
 real vs. local-only). This doc describes the target end-state
@@ -109,6 +109,19 @@ AISStream's `PositionReport` message type, not `ShipStaticData` (where
 AIS actually reports vessel type). Capturing that and mapping MMSI ->
 vessel_type_id would be the natural next step to make the dimension
 actually used rather than a populated-but-unreferenced reference table.
+
+## Infrastructure as Code (Phase 8)
+
+`infra/cloudformation/` has three split stacks (`ingestion.yaml`,
+`processing.yaml`, `warehouse.yaml`) consolidating everything above.
+Verified via `cfn-lint` (zero warnings) and `aws cloudformation
+validate-template` against the real account (read-only). **Not
+deployed** -- and `ingestion.yaml` specifically can't be deployed as a
+new stack without conflicts right now, since it defines resources
+(Kinesis stream, 2 IAM roles, Glue database/table) with the exact same
+names as what `streaming/deploy.py` already created for real in Phase 2.
+See `infra/cloudformation/DEPLOY.md` for deployment order, commands, and
+this conflict in full.
 
 ## Orchestration and monitoring
 

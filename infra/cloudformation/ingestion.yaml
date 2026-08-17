@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PortPulse ingestion stack: Kinesis stream, S3 raw zone, Firehose delivery
+  stream, Glue database/table/crawler, and their IAM roles. Consolidates
+  what streaming/deploy.py already proved works via boto3 (Kinesis stream,
+  S3 bucket, IAM roles, and Glue database/table were actually created and
+  verified this way -- see README Build status; the Glue crawler and
+  Firehose delivery stream were blocked by an account-level AccessDenied
+  issue, not a config problem, so this template's crawler/Firehose
+  resources are unverified against a real deploy of THIS template
+  specifically, though the same API calls were exercised via boto3).
+  NOT DEPLOYED as CloudFormation -- validated with
+  `aws cloudformation validate-template` only.
+
+Parameters:
+  RawBucketName:
+    Type: String
+    Description: Globally-unique S3 bucket name for the raw zone (e.g. portpulse-raw-<account-id>)
+  KinesisStreamName:
+    Type: String
+    Default: portpulse-ais-positions
+  GlueDatabaseName:
+    Type: String
+    Default: portpulse
+  RawTableName:
+    Type: String
+    Default: ais_positions_raw
+
+Resources:
+  KinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Ref KinesisStreamName
+      StreamModeDetails:
+        StreamMode: ON_DEMAND
+
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref RawBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: portpulse-firehose-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: firehose.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: portpulse-firehose-inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetBucketLocation, s3:ListBucket]
+                Resource: "*"
+              - Effect: Allow
+                Action: [kinesis:DescribeStream, kinesis:GetShardIterator, kinesis:GetRecords, kinesis:ListShards]
+                Resource: !GetAtt KinesisStream.Arn
+              - Effect: Allow
+                Action: [glue:GetTable, glue:GetTableVersion, glue:GetTableVersions]
+                Resource: "*"
+
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: portpulse-glue-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: portpulse-glue-inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource: "*"
+              - Effect: Allow
+                Action: [glue:*]
+                Resource: "*"
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: "*"
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: PortPulse port congestion analytics
+
+  # Column list/types mirror streaming/table_schema.py -- see that module
+  # for why timestamp is kept as a string rather than the Glue timestamp
+  # type, and why port_zone appears as both a column and a partition key.
+  GlueRawTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabaseName
+      TableInput:
+        Name: !Ref RawTableName
+        TableType: EXTERNAL_TABLE
+        PartitionKeys:
+          - { Name: port_zone, Type: string }
+          - { Name: date, Type: string }
+          - { Name: hour, Type: string }
+        StorageDescriptor:
+          Location: !Sub "s3://${RawBucketName}/raw/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - { Name: mmsi, Type: bigint }
+            - { Name: lat, Type: double }
+            - { Name: lon, Type: double }
+            - { Name: speed_knots, Type: double }
+            - { Name: course_deg, Type: double }
+            - { Name: timestamp, Type: string }
+            - { Name: port_zone, Type: string }
+            - { Name: ship_name, Type: string }
+            - { Name: nav_status, Type: int }
+    DependsOn: GlueDatabase
+
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: portpulse-raw-crawler
+      Role: !GetAtt GlueRole.Arn
+      DatabaseName: !Ref GlueDatabaseName
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${RawBucketName}/raw/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+    DependsOn: GlueDatabase
+
+  # PRIMARY config: Parquet format conversion + dynamic partitioning in
+  # one delivery stream, per the project spec. UNVERIFIED whether AWS
+  # accepts this combination in a single Firehose stream -- checked
+  # multiple AWS doc pages during Phase 2, found no definitive answer
+  # either way (see streaming/firehose_config.py's module docstring and
+  # README Build status for the full writeup and the tested fallback:
+  # dynamic partitioning + raw JSON, Parquet conversion deferred to the
+  # EMR job -- swap this resource for that shape if CreateDeliveryStream
+  # rejects the combination on first real deploy).
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: portpulse-ais-raw
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt KinesisStream.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+      ExtendedS3DestinationConfiguration:
+        RoleARN: !GetAtt FirehoseRole.Arn
+        BucketARN: !GetAtt RawBucket.Arn
+        Prefix: "raw/port_zone=!{partitionKeyFromQuery:port_zone}/date=!{partitionKeyFromQuery:date}/hour=!{partitionKeyFromQuery:hour}/"
+        ErrorOutputPrefix: "raw-errors/!{firehose:error-output-type}/"
+        BufferingHints:
+          SizeInMBs: 64
+          IntervalInSeconds: 300
+        DynamicPartitioningConfiguration:
+          Enabled: true
+          RetryOptions:
+            DurationInSeconds: 300
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: MetadataExtraction
+              Parameters:
+                - ParameterName: MetadataExtractionQuery
+                  ParameterValue: '{port_zone: (.port_zone // "UNKNOWN"), date: (.timestamp[0:10]), hour: (.timestamp[11:13])}'
+                - ParameterName: JsonParsingEngine
+                  ParameterValue: JQ-1.6
+        DataFormatConversionConfiguration:
+          Enabled: true
+          SchemaConfiguration:
+            RoleARN: !GetAtt FirehoseRole.Arn
+            DatabaseName: !Ref GlueDatabaseName
+            TableName: !Ref RawTableName
+            Region: !Ref AWS::Region
+            CatalogId: !Ref AWS::AccountId
+            VersionId: LATEST
+          InputFormatConfiguration:
+            Deserializer:
+              OpenXJsonSerDe: {}
+          OutputFormatConfiguration:
+            Serializer:
+              ParquetSerDe:
+                Compression: SNAPPY
+    DependsOn: GlueRawTable
+
+  FirehoseConversionFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: portpulse-firehose-conversion-failures
+      Namespace: AWS/Firehose
+      MetricName: FailedConversion.Records
+      Dimensions:
+        - Name: DeliveryStreamName
+          Value: !Ref FirehoseDeliveryStream
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  KinesisStreamArn:
+    Value: !GetAtt KinesisStream.Arn
+  RawBucketName:
+    Value: !Ref RawBucket
+  RawBucketArn:
+    Value: !GetAtt RawBucket.Arn
+  GlueDatabaseName:
+    Value: !Ref GlueDatabaseName
+  FirehoseDeliveryStreamArn:
+    Value: !GetAtt FirehoseDeliveryStream.Arn

@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PortPulse warehouse stack: Redshift Serverless namespace/workgroup, plus
+  the 15-minute EventBridge-triggered Lambda that publishes the
+  CuratedFreshnessMinutes CloudWatch metric and the alarm that watches it.
+  NOT DEPLOYED -- validated with `aws cloudformation validate-template`
+  only. warehouse/deploy.py's boto3 equivalent was dry-run tested against
+  the real AWS account (read-only checks only) but never run with
+  --confirm -- see README Build status.
+
+Parameters:
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Redshift namespace admin password (never logged/echoed by CloudFormation)
+  PubliclyAccessible:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: >
+      false (default) means querying must go through the Redshift Data API
+      (see dashboard/data_source.py's load_redshift()), not direct psql/
+      JDBC -- avoids needing VPC/security-group setup this project
+      doesn't have. Set true only if direct DB-client access is wanted
+      instead (also needs a security group rule this stack doesn't add).
+
+Resources:
+  RedshiftNamespace:
+    Type: AWS::RedshiftServerless::Namespace
+    Properties:
+      NamespaceName: portpulse
+      DbName: portpulse
+      AdminUsername: portpulse_admin
+      AdminUserPassword: !Ref AdminPassword
+
+  RedshiftWorkgroup:
+    Type: AWS::RedshiftServerless::Workgroup
+    Properties:
+      WorkgroupName: portpulse-wg
+      NamespaceName: !Ref RedshiftNamespace
+      BaseCapacity: 4  # RPU minimum -- $0.375/RPU-hour, billed only while active (60s minimum), $0 while auto-paused
+      PubliclyAccessible: !Ref PubliclyAccessible
+
+  FreshnessLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: portpulse-freshness-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: portpulse-freshness-lambda-inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: "*"
+              - Effect: Allow
+                Action: [redshift-data:ExecuteStatement, redshift-data:DescribeStatement, redshift-data:GetStatementResult]
+                Resource: "*"
+              - Effect: Allow
+                Action: [cloudwatch:PutMetricData]
+                Resource: "*"
+
+  # Inline source, kept identical to orchestration/check_freshness.py.
+  # See processing.yaml's TriggerEmrJobFunction comment for why Handler
+  # is "index.handler" here rather than "check_freshness.handler".
+  CheckFreshnessFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: portpulse-check-freshness
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt FreshnessLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          REDSHIFT_WORKGROUP: !Ref RedshiftWorkgroup
+          REDSHIFT_DATABASE: portpulse
+      Code:
+        ZipFile: |
+          import os
+          import time
+          from datetime import datetime, timezone
+          from typing import Any, Optional
+
+          FRESHNESS_METRIC_NAMESPACE = "PortPulse"
+          FRESHNESS_METRIC_NAME = "CuratedFreshnessMinutes"
+
+
+          def _latest_curated_hour(data_client, workgroup_name, database):
+              resp = data_client.execute_statement(
+                  WorkgroupName=workgroup_name, Database=database,
+                  Sql="SELECT MAX(hour_start) AS latest FROM portpulse.fact_port_congestion_hourly",
+              )
+              statement_id = resp["Id"]
+              while True:
+                  desc = data_client.describe_statement(Id=statement_id)
+                  if desc["Status"] == "FINISHED":
+                      break
+                  if desc["Status"] in ("FAILED", "ABORTED"):
+                      raise RuntimeError(f"Freshness query failed: {desc.get('Error')}")
+                  time.sleep(1)
+
+              result = data_client.get_statement_result(Id=statement_id)
+              records = result["Records"]
+              if not records or "stringValue" not in records[0][0]:
+                  return None
+              return datetime.fromisoformat(records[0][0]["stringValue"]).replace(tzinfo=timezone.utc)
+
+
+          def handler(event: dict, context: Any, data_client: Optional[Any] = None, cw_client: Optional[Any] = None) -> dict:
+              if data_client is None or cw_client is None:
+                  import boto3
+                  data_client = data_client or boto3.client("redshift-data")
+                  cw_client = cw_client or boto3.client("cloudwatch")
+
+              workgroup_name = os.environ.get("REDSHIFT_WORKGROUP", "portpulse-wg")
+              database = os.environ.get("REDSHIFT_DATABASE", "portpulse")
+
+              latest_hour = _latest_curated_hour(data_client, workgroup_name, database)
+
+              if latest_hour is None:
+                  staleness_minutes = float("inf")
+                  reported_value = 99999.0
+              else:
+                  staleness_minutes = (datetime.now(timezone.utc) - latest_hour).total_seconds() / 60.0
+                  reported_value = staleness_minutes
+
+              cw_client.put_metric_data(
+                  Namespace=FRESHNESS_METRIC_NAMESPACE,
+                  MetricData=[{"MetricName": FRESHNESS_METRIC_NAME, "Value": reported_value, "Unit": "None"}],
+              )
+              return {"staleness_minutes": staleness_minutes, "latest_hour": str(latest_hour)}
+
+  FreshnessCheckRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: portpulse-freshness-check
+      ScheduleExpression: rate(15 minutes)
+      State: ENABLED
+      Targets:
+        - Id: "1"
+          Arn: !GetAtt CheckFreshnessFunction.Arn
+
+  FreshnessCheckPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CheckFreshnessFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FreshnessCheckRule.Arn
+
+  FreshnessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: portpulse-curated-data-stale
+      Namespace: PortPulse
+      MetricName: CuratedFreshnessMinutes
+      Statistic: Maximum
+      Period: 900
+      EvaluationPeriods: 2
+      Threshold: 90
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+
+Outputs:
+  RedshiftWorkgroupName:
+    Value: !Ref RedshiftWorkgroup
+  RedshiftNamespaceName:
+    Value: !Ref RedshiftNamespace

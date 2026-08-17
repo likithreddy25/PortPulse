@@ -5,7 +5,7 @@ at 5 major container ports via AIS and computes a per-port congestion
 index (vessel count, dwell time, queue length) with a short-horizon
 forecast.
 
-**Status: Phases 1-7 of 9 built and tested locally.** This is a
+**Status: Phases 1-8 of 9 built and tested locally.** This is a
 portfolio project built incrementally and validated at each phase — see
 [Build status](#build-status) for exactly what's working today versus
 what's still ahead. **Partial real AWS deployment exists** (Kinesis
@@ -309,7 +309,37 @@ deployed):**
 - 6 new tests (Lambda handler logic tested via dependency-injected mock
   clients, not a real Lambda runtime), 66 total, all passing.
 
-**Not yet built:** CloudFormation (Phase 8), teardown tooling (Phase 9).
+**What's built and tested (Phase 8 — CloudFormation, not deployed):**
+- Three split stacks in `infra/cloudformation/` (`ingestion.yaml`,
+  `processing.yaml`, `warehouse.yaml`), consolidating everything built
+  across Phases 1-7 into proper IaC rather than the ad hoc boto3 deploy
+  scripts each phase used to get built and validated. See
+  `infra/cloudformation/DEPLOY.md` for deployment order and commands.
+- **Verified two ways, neither of which is "actually deployed"**: all
+  three pass `cfn-lint` with zero warnings (caught and fixed one real
+  issue — a redundant `DependsOn` cfn-lint correctly flagged), and all
+  three pass `aws cloudformation validate-template` against the real AWS
+  account (read-only, confirms YAML/resource/parameter structure,
+  creates nothing).
+- **Important, honestly-documented limitation found while writing
+  `DEPLOY.md`**: `ingestion.yaml` cannot actually be deployed as a new
+  stack right now without conflicts — the Kinesis stream, both IAM
+  roles, and the Glue database/table it defines have the exact same
+  names as the resources `streaming/deploy.py` already created for real
+  in Phase 2 (see Cost above). Deploying this stack as-is today would
+  hit `AlreadyExists` errors on four separate resources. Recommended
+  fix, not yet done: run Phase 9's `teardown.sh` first.
+- Verified two AWS API/CFN facts by checking real docs rather than
+  guessing while writing these templates: CloudFormation's inline Lambda
+  `ZipFile` always names the file `index.py` (so `Handler` must be
+  `index.handler`, not e.g. `trigger_emr_job.handler` — different from
+  how `orchestration/deploy.py` names it when zip-packaging the same
+  source), and the exact required/optional properties for
+  `AWS::EMRServerless::Application` and `AWS::RedshiftServerless::Namespace`/`Workgroup`
+  (newer resource types, checked rather than assumed).
+- 6 new tests, 72 total, all passing.
+
+**Not yet built:** teardown tooling (Phase 9).
 
 **About the sample data:** two files live in `ingestion/sample_data/`,
 and they are not interchangeable —
