@@ -7,6 +7,12 @@ at 5 major container ports via AIS and computes a per-port congestion
 index (vessel count, dwell time, queue length) with a short-horizon
 forecast.
 
+![PortPulse dashboard](docs/dashboard.png)
+
+*Dashboard in demo mode on the real captured AIS sample (4 ports, one hour). Trend and
+forecast charts appear once enough history exists; the dashboard says so instead of
+drawing a fake one.*
+
 **Status: all 11 phases built and tested** (Phases 1-9 as originally
 planned, plus Phase 10 — a DynamoDB watermark/dedup table — and Phase 11
 — a classical hypothesis-testing module). This is a portfolio project
