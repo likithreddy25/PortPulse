@@ -19,16 +19,17 @@ planned, plus Phase 10 — a DynamoDB watermark/dedup table — and Phase 11
 built incrementally and validated at each phase — see
 [Build status](#build-status) for exactly what's working today, what's
 verified against real AWS vs. `moto`/local-only, and what's still
-aspirational. **Nothing is currently deployed to AWS except one empty S3
-bucket** — a partial Phase 2 deployment (Kinesis stream, IAM roles, Glue
-database/table) ran for about an hour, then was torn down for real with
-`teardown.sh` once Phases 1-9 were complete (see Cost below). Phase 10's
-DynamoDB table was likewise deployed for real, exercised for about 3
-minutes, and torn down, with the deletion verified. The Glue
-crawler and everything downstream of it were blocked on an
-account-level issue that's still unresolved. No component here has been
-deployed as a continuously-running production pipeline — see the Resume
-bullet section for exactly what is and isn't claimed.
+aspirational. **Nothing is currently running on AWS.** Each stage was
+deployed to a real account, exercised, and torn down to avoid cost (see
+[Real AWS deployment](#real-aws-deployment-2026-10-06-torn-down) and Cost
+below): ingestion (Kinesis → Firehose → S3, 2,717 real AIS records, exact
+row-count match), an EMR Serverless run of the Spark job, a Redshift
+Serverless COPY/MERGE load, a Lambda trigger, and the Phase 10 DynamoDB
+table. The Glue crawler is denied at the account level, so it is an
+optional template parameter and the table is declared explicitly instead.
+No component here has been deployed as a continuously-running production
+pipeline — see the Resume bullet section for exactly what is and isn't
+claimed.
 
 ## Ports tracked
 
