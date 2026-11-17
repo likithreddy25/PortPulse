@@ -1,5 +1,7 @@
 # PortPulse
 
+![tests](https://github.com/likithreddy25/portpulse/actions/workflows/tests.yml/badge.svg)
+
 Real-time global port congestion analytics. Tracks live cargo-ship traffic
 at 5 major container ports via AIS and computes a per-port congestion
 index (vessel count, dwell time, queue length) with a short-horizon
@@ -80,9 +82,26 @@ account (us-east-1) and exercised end to end, then fully torn down (~25 min, est
   and `pipeline.py` alone cannot run on EMR (imports local packages and openlineage), so
   `scripts/build_emr_bundle.sh` builds a `--py-files` bundle (openlineage-python pinned to 1.45.0 because
   EMR 7.1.0 runs Python 3.9). `processing.yaml` gained `HourlyTriggerState` for manual test deploys.
-- **Not completed:** the EMR Serverless job run. The account's EMR Serverless "Max concurrent vCPUs"
-  quota is 0, so the application could not be created; an increase was requested. The Redshift
-  warehouse and the Airflow DAG have still not been run on real infrastructure.
+- **EMR Serverless job run (2026-10-15, torn down):** `processing.yaml` deployed, then `pipeline.py` ran on
+  EMR Serverless (emr-7.1.0) over the 2,717 captured AIS records after normalizing them with
+  `ingestion/schema.py` (state SUCCESS, 0.108 vCPU-hours). Output: curated Parquet for 4 ports (NLRTM, SGSIN,
+  USLAX, USNYC), one row per port-hour (4 rows; the capture spans a single hour). A first attempt failed because
+  the raw AISStream messages were passed instead of normalized records; fixed by normalizing first. This is a
+  small-data functional run, not a scale test.
+- **Redshift Serverless load (2026-10-15, torn down):** deployed `warehouse.yaml` (with a new S3-read COPY role),
+  applied the star schema and seeds via the Data API, COPY-loaded the EMR curated Parquet and MERGE-upserted it
+  into `fact_port_congestion_hourly`: 4 rows (NLRTM 401, SGSIN 81, USLAX 108, USNYC 89 vessels). Two real
+  findings fixed: Spark's `port_id=` partition folders mean the files have no `port_id` column (load now COPYs
+  each port folder and sets `port_id` from the path), and Redshift's Parquet COPY needs BIGINT/DOUBLE staging
+  types matching the file's int64/double. Script: `warehouse/live_load.py`.
+- **Scale run (2026-10-15, torn down):** `batch/emr_jobs/reviews_scale.py` aggregated the Amazon Reviews 2023
+  Video Games category (814 MB gzipped JSONL) on EMR Serverless: **4,624,615 reviews, 137,249 products, 297
+  months, 101 s**, 0.342 vCPU-hours (about $0.02 of compute). Numbers come from the job's own run_summary output.
+- **Lambda trigger (2026-10-15, torn down):** invoking `portpulse-trigger-emr-job` started a real EMR Serverless
+  job that finished SUCCESS. The first invoke failed with AccessDenied: the Lambda role lacked `iam:PassRole` on
+  the EMR execution role; fixed in `processing.yaml` (scoped to emr-serverless) and re-verified live. The
+  EventBridge schedule rule itself stayed DISABLED and was not exercised.
+- **Not completed:** the Airflow DAG has not been run on real infrastructure.
 - Also open: the scheduled Lambda trigger in `processing.yaml` does not pass `--py-files`, so it would fail
   on EMR as written.
 
